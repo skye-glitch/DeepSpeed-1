@@ -188,6 +188,9 @@ class PipelineEngine(DeepSpeedEngine):
             self.loss_model = self.module.loss_fn
 
         self.has_attention_mask = self.module.__class__.__name__ == 'GPT2ModelPipe'
+        #my todo: lets do the same for our model:
+        self.needs_to_remove = self.module.__class__.__name__ in ['ViTEmbeddingEncoder','ViTEmbeddingDecoder', 'ViTHeadEncoder','ViTHeadDecoder','_Block']
+
         # Initialize pipeline communicators. Just send a 0.
         if is_even(self.stage_id):
             if not self.is_last_stage():
@@ -219,6 +222,10 @@ class PipelineEngine(DeepSpeedEngine):
     def set_has_attention_mask(self, value):
         assert isinstance(value, bool)
         self.has_attention_mask = value
+    #my todo: let's do the same for our model:
+    def needs_to_remove(self, value):
+        assert isinstance(value, bool)
+        self.needs_to_remove = value
 
     def _build_data_iter(self, dataset):
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -761,9 +768,16 @@ class PipelineEngine(DeepSpeedEngine):
 
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
-            out_tensors = [t for t in outputs if t.is_floating_point()]
+            # out_tensors = [t for t in outputs if t.is_floating_point()]
+            # assert len(out_tensors) == len(grad_tensors)
+            # torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
+            #my todo: don't backward for anything other than x
+            out_tensors = [t for t in outputs if (t.is_floating_point() and len(t.shape) == 3)]
+            #print(f'len out {len(out_tensors)} len grad {len(grad_tensors)}')
+            #print(f'grad shape {grad_tensors[0].shape}')
             assert len(out_tensors) == len(grad_tensors)
             torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
+            
         else:
             torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
 
@@ -794,7 +808,9 @@ class PipelineEngine(DeepSpeedEngine):
             loaded = None
             if torch.is_tensor(batch[0]):
                 loaded = batch[0].clone().to(self.device).detach()
-                loaded.requires_grad = loaded.is_floating_point()
+                #loaded.requires_grad = loaded.is_floating_point()
+                #my todo
+                loaded.requires_grad = (loaded.is_floating_point() and len(loaded.shape) == 3)
             else:
                 assert isinstance(batch[0], tuple)
                 # Assume list or tuple
@@ -802,7 +818,9 @@ class PipelineEngine(DeepSpeedEngine):
                 for x in batch[0]:
                     assert torch.is_tensor(x)
                     mine = x.clone().detach().to(self.device)
-                    mine.requires_grad = mine.is_floating_point()
+                    #mine.requires_grad = mine.is_floating_point()
+                    #my todo
+                    mine.requires_grad = (mine.is_floating_point() and len(mine.shape) == 3)
                     loaded.append(mine)
                 loaded = tuple(loaded)
 
@@ -1014,6 +1032,12 @@ class PipelineEngine(DeepSpeedEngine):
             inputs = list(inputs)
             inputs.pop()
             inputs = tuple(inputs)
+        #my todo: let's do the same for our model:
+        if self.needs_to_remove:
+            inputs = list(inputs)
+            #while len(inputs) > 1:
+            inputs.pop()
+            inputs = tuple(inputs)
 
         if isinstance(inputs, torch.Tensor):
             assert inputs.grad is not None
@@ -1027,7 +1051,11 @@ class PipelineEngine(DeepSpeedEngine):
             else:
                 for idx, buffer in enumerate(inputs):
                     # Skip tensors that will not produce a grad
-                    if not buffer.is_floating_point():
+                    # if not buffer.is_floating_point():
+                    #     assert buffer.grad is None
+                    #     continue
+                    #my todo: anything other than first does not require grad
+                    if not buffer.is_floating_point() or len(buffer.shape) != 3:
                         assert buffer.grad is None
                         continue
                     assert buffer.grad is not None
@@ -1052,7 +1080,9 @@ class PipelineEngine(DeepSpeedEngine):
         if isinstance(self.pipe_recv_buf, torch.Tensor):
             p2p.recv(self.pipe_recv_buf, self.prev_stage)
             recvd = self.pipe_recv_buf.clone().detach()
-            recvd.requires_grad = recvd.is_floating_point()
+            #recvd.requires_grad = recvd.is_floating_point()
+            #my todo
+            recvd.requires_grad = recvd.is_floating_point() and len(recvd.shape) == 3
         else:
             assert isinstance(self.pipe_recv_buf, tuple)
             recvd = [None] * len(self.pipe_recv_buf)
@@ -1077,7 +1107,7 @@ class PipelineEngine(DeepSpeedEngine):
             recvd = tuple(recvd)
 
             for buffer in recvd:
-                buffer.requires_grad = buffer.is_floating_point()
+                buffer.requires_grad = (buffer.is_floating_point() and len(buffer.shape) == 3)
 
         self.pipe_buffers['inputs'][buffer_id] = recvd
 
@@ -1123,16 +1153,28 @@ class PipelineEngine(DeepSpeedEngine):
                 # filtered out the metadata tensor. This quick (hacky) fix just
                 # branches on is_grad_partitioned so we don't filter out the
                 # metadata tensor.
+                # if self.is_grad_partitioned:
+                #     sizes_and_dtypes = [
+                #         (list(t.size()),
+                #          t.dtype) for t in outputs[:2]
+                #     ] + [(list(t.size()),
+                #           t.dtype) for t in outputs[2:] if t.is_floating_point()]
+                # else:
+                #     sizes_and_dtypes = [(list(t.size()),
+                #                          t.dtype) for t in outputs
+                #                         if t.is_floating_point()]
+                #my todo: do the same?
                 if self.is_grad_partitioned:
                     sizes_and_dtypes = [
                         (list(t.size()),
                          t.dtype) for t in outputs[:2]
                     ] + [(list(t.size()),
-                          t.dtype) for t in outputs[2:] if t.is_floating_point()]
+                          t.dtype) for t in outputs[2:] if (t.is_floating_point() and len(t.shape) == 3)]
                 else:
                     sizes_and_dtypes = [(list(t.size()),
                                          t.dtype) for t in outputs
-                                        if t.is_floating_point()]
+                                        if (t.is_floating_point() and len(t.shape) == 3)]
+                
                 self.grad_layer = self._allocate_buffers(sizes_and_dtypes,
                                                          num_buffers=1)[0]
 

@@ -177,7 +177,9 @@ class SlurmRunner(MultiNodeRunner):
         assert not getattr(self.args, 'detect_nvlink_pairs', False), "slurm backend does not support remapping visible devices"
         total_process_count = sum(self.resource_pool.values())
         srun_cmd = [
-            'srun',
+        #    'srun',
+        #my todo: change launcher
+            'ibrun',
             '-n',
             f'{total_process_count}',
         ]
